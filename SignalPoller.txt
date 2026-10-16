@@ -1,0 +1,142 @@
+package com.tradeexpert.app;
+
+import android.os.Handler;
+import android.os.Looper;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * Checks the platform for new signals of the activated bots, from the app itself, so the pop-out
+ * console receives a portal signal even when the app is left and the web page is paused.
+ * The page hands over its session (token, bot ids) through TeBridge.authState.
+ */
+final class SignalPoller {
+
+    private static final ScheduledExecutorService exec = Executors.newSingleThreadScheduledExecutor();
+    private static final Set<String> seen = new HashSet<>();
+    private static volatile String token, rest, anon;
+    private static volatile String[] ids = new String[0];
+    private static volatile boolean seeded = false;
+    private static volatile boolean started = false;
+    private static volatile android.content.Context appCtx;
+    private static String lastNote = "";
+    private static long lastNoteAt = 0;
+
+    private SignalPoller() {}
+
+    /** The page's session and bot ids (sent on every page check). */
+    static void setAuth(android.content.Context c, String json) {
+        appCtx = c.getApplicationContext();
+        try {
+            JSONObject o = new JSONObject(json);
+            token = o.optString("token", null);
+            rest = o.optString("rest", null);
+            anon = o.optString("anon", null);
+            JSONArray a = o.optJSONArray("ids");
+            String[] list = new String[a == null ? 0 : a.length()];
+            for (int i = 0; i < list.length; i++) list[i] = a.optString(i);
+            ids = list;
+        } catch (Exception ignored) {
+        }
+        if (!started) {
+            started = true;
+            exec.scheduleWithFixedDelay(SignalPoller::tick, 1500, 4000, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /** The bot was switched on: the signals that are already there are not announced again. */
+    static void botTurnedOn() {
+        seeded = false;
+    }
+
+    /** True while the app does this check itself (the page then leaves it to the app). */
+    static boolean active() {
+        return started && token != null && ids.length > 0 && BubbleService.botOn;
+    }
+
+    /** Short on-screen note of what the signal check is doing (shown when it changes, at most every 20 s). */
+    private static void note(final String msg) {
+        long now = System.currentTimeMillis();
+        if (msg.equals(lastNote) && now - lastNoteAt < 20000) return;
+        lastNote = msg;
+        lastNoteAt = now;
+        android.content.Context c = appCtx;
+        if (c == null) return;
+        new Handler(Looper.getMainLooper()).post(() ->
+                android.widget.Toast.makeText(c, "Signals: " + msg, android.widget.Toast.LENGTH_SHORT).show());
+    }
+
+    private static void tick() {
+        try {
+            if (!BubbleService.botOn) return;
+            if (token == null || rest == null || anon == null) { note("waiting for login"); return; }
+            if (ids.length == 0) { note("no active bot"); return; }
+            StringBuilder inList = new StringBuilder();
+            for (String id : ids) {
+                if (inList.length() > 0) inList.append(',');
+                inList.append(URLEncoder.encode(id, "UTF-8"));
+            }
+            String url = rest + "signals?select=id,symbol,direction,action,lot_size,entry_price,take_profit,stop_loss,created_at"
+                    + "&ea_id=in.(" + inList + ")&order=created_at.desc&limit=30";
+            HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+            c.setConnectTimeout(8000);
+            c.setReadTimeout(8000);
+            c.setRequestProperty("apikey", anon);
+            c.setRequestProperty("Authorization", "Bearer " + token);
+            int code = c.getResponseCode();
+            if (code != 200) { note("platform answered " + code); return; }
+            JSONArray rows = new JSONArray(read(c.getInputStream()));
+            note("checking " + ids.length + " bot(s), " + rows.length() + " signal(s)");
+            // oldest first, so the console writes them in order
+            for (int i = rows.length() - 1; i >= 0; i--) {
+                JSONObject r = rows.getJSONObject(i);
+                String id = r.optString("id");
+                if (id.isEmpty() || seen.contains(id)) continue;
+                seen.add(id);
+                if (!seeded) continue;
+                announce(r);
+            }
+            seeded = true;
+        } catch (Exception e) {
+            note("check failed: " + e.getClass().getSimpleName());
+        }
+    }
+
+    private static void announce(JSONObject r) throws Exception {
+        JSONObject sig = new JSONObject();
+        sig.put("phase", "received");
+        sig.put("symbol", r.optString("symbol", ""));
+        sig.put("direction", r.optString("direction", "").toUpperCase());
+        sig.put("stopLoss", r.isNull("stop_loss") ? JSONObject.NULL : r.opt("stop_loss"));
+        sig.put("takeProfit", r.isNull("take_profit") ? JSONObject.NULL : r.opt("take_profit"));
+        sig.put("why", "");
+        String json = sig.toString();
+        new Handler(Looper.getMainLooper()).post(() -> BubbleService.setTradeExecuted(json));
+        String title = (r.optString("action", "SIGNAL") + " " + r.optString("symbol", "") + " "
+                + r.optString("direction", "")).trim();
+        String body = "Lot " + r.optString("lot_size", "-");
+        if (appCtx != null) new TeBridge(appCtx).show(title, body);
+    }
+
+    private static String read(InputStream in) throws Exception {
+        try (InputStream is = in) {
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            int n;
+            while ((n = is.read(buf)) > 0) out.write(buf, 0, n);
+            return new String(out.toByteArray(), StandardCharsets.UTF_8);
+        }
+    }
+}

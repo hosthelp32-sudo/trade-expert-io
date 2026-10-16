@@ -1,0 +1,96 @@
+package com.tradeexpert.app;
+
+import android.content.Context;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.content.Intent;
+import android.os.Handler;
+import android.os.Looper;
+import android.webkit.JavascriptInterface;
+import android.widget.Toast;
+
+import org.json.JSONObject;
+
+/** What the web page reports to the app: the bot switch (ON / OFF). */
+public class TeBridge {
+
+    static final String CHANNEL = "te_signals";
+
+    private final Context ctx;
+    private int nextId = 2000;
+
+    public TeBridge(Context c) {
+        ctx = c.getApplicationContext();
+    }
+
+    @JavascriptInterface
+    public void botState(boolean on) {
+        if (on) SignalPoller.botTurnedOn();
+        BubbleService.setBotOn(ctx, on);
+    }
+
+    /** The web console's name, picture and lines (for the card over other apps). */
+    @JavascriptInterface
+    public void consoleData(String json) {
+        BubbleService.setConsole(json);
+    }
+
+    /** The page's session and bot ids: the app checks the platform for new signals itself (JSON). */
+    @JavascriptInterface
+    public void authState(String json) {
+        SignalPoller.setAuth(ctx, json);
+    }
+
+    /** True while the app itself checks for signals (the page then leaves it to the app). */
+    @JavascriptInterface
+    public boolean nativeSignals() {
+        return SignalPoller.active();
+    }
+
+    /** A signal arrived (website, chart scanner or self-host): the console opens and writes it at once (JSON). */
+    @JavascriptInterface
+    public void signalReceived(String json) {
+        BubbleService.setTradeExecuted(json);
+    }
+
+    /** The chart scanner's trades were placed (after EXECUTE TRADE): the signal, levels and count (JSON). */
+    @JavascriptInterface
+    public void tradeExecuted(String json) {
+        BubbleService.setTradeExecuted(json);
+    }
+
+    /** The web console data for the card. */
+
+    /** A short status from the page (for testing). */
+    @JavascriptInterface
+    public void status(final String text) {
+        new Handler(Looper.getMainLooper()).post(() ->
+                Toast.makeText(ctx, "Display: " + text, Toast.LENGTH_SHORT).show());
+    }
+
+    /** A new signal: a notification. */
+    @JavascriptInterface
+    public void show(String title, String body) {
+        try {
+            NotificationChannel ch = new NotificationChannel(CHANNEL, "Signals", NotificationManager.IMPORTANCE_HIGH);
+            ch.enableVibration(true);
+            ctx.getSystemService(NotificationManager.class).createNotificationChannel(ch);
+            PendingIntent pi = PendingIntent.getActivity(ctx, 0,
+                    new Intent(ctx, MainActivity.class).setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                    PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+            Notification n = new Notification.Builder(ctx, CHANNEL)
+                    .setSmallIcon(R.drawable.app_logo)
+                    .setContentTitle(title)
+                    .setContentText(body)
+                    .setStyle(new Notification.BigTextStyle().bigText(body))
+                    .setCategory(Notification.CATEGORY_MESSAGE)
+                    .setAutoCancel(true)
+                    .setContentIntent(pi)
+                    .build();
+            ctx.getSystemService(NotificationManager.class).notify(nextId++, n);
+        } catch (Exception ignored) {
+        }
+    }
+}
